@@ -1,0 +1,223 @@
+我们将按照帧缓冲区的使用情景以及硬件抽象层编写规范来介绍Gralloc模块的实现。
+
+用户空间的应用程序在使用帧缓冲区之间，首先要加载Gralloc模块，并且获得一个gralloc设备和一个fb设备。有了gralloc设备之后， 用户空间中的应用程序就可以申请分配一块图形缓冲区，并且将这块图形缓冲区映射到应用程序的地址空间来，以便可以向里面写入要绘制的画面的内容。
+最后，用户空间中的应用程序就通过fb设备来将前面已经准备好了的图形缓冲区渲染到帧缓冲区中去，即将图形缓冲区的内容绘制到显示屏中去。
+
+相应地，当用户空间中的应用程序不再需要使用一块图形缓冲区的时候，就可以通过gralloc设备来释放它，并且将它从地址空间中解除映射。
+
+接下来，我们就按照上述使用情景来分析Gralloc模块的实现。
+
+1. Gralloc模块的加载过程。
+
+每一个 HAL 模块都有一个ID值，以这些ID值为参数来调用硬件抽象层提供的函数 hw_get_module 就可以将指定的模块加载到内存来，并且获得一个 hw_module_t 接口来打开相应的设备。
+
+Gralloc模块的ID值定义在 hardware/libhardware/include/hardware/gralloc.h 文件中，如下所示：
+
+#define GRALLOC_HARDWARE_MODULE_ID "gralloc"  
+
+函数 hw_get_module 实现在 hardware/libhardware/hardware.c 文件中，如下所示：
+
+/** Base path of the hal modules */  
+#define HAL_LIBRARY_PATH1 "/system/lib/hw"  
+#define HAL_LIBRARY_PATH2 "/vendor/lib/hw"  
+  
+/** 
+ * There are a set of variant filename for modules. The form of the filename 
+ * is "<MODULE_ID>.variant.so" so for the led module the Dream variants  
+ * of base "ro.product.board", "ro.board.platform" and "ro.arch" would be: 
+ * 
+ * led.trout.so 
+ * led.msm7k.so 
+ * led.ARMV6.so 
+ * led.default.so 
+ */  
+  
+static const char *variant_keys[] = {  
+    "ro.hardware",  /* This goes first so that it can pick up a different 
+                       file on the emulator. */  
+    "ro.product.board",  
+    "ro.board.platform",  
+    "ro.arch"  
+};  
+  
+static const int HAL_VARIANT_KEYS_COUNT =  
+    (sizeof(variant_keys)/sizeof(variant_keys[0]));  
+  
+......  
+  
+int hw_get_module(const char *id, const struct hw_module_t **module)  
+{  
+    int status;  
+    int i;  
+    const struct hw_module_t *hmi = NULL;  
+    char prop[PATH_MAX];  
+    char path[PATH_MAX];  
+  
+    /* 
+     * Here we rely on the fact that calling dlopen multiple times on 
+     * the same .so will simply increment a refcount (and not load 
+     * a new copy of the library). 
+     * We also assume that dlopen() is thread-safe. 
+     */  
+  
+    /* Loop through the configuration variants looking for a module */  
+    for (i=0 ; i<HAL_VARIANT_KEYS_COUNT+1 ; i++) {  
+        if (i < HAL_VARIANT_KEYS_COUNT) {  
+            if (property_get(variant_keys[i], prop, NULL) == 0) {  
+                continue;  
+            }  
+  
+            snprintf(path, sizeof(path), "%s/%s.%s.so",  
+                    HAL_LIBRARY_PATH1, id, prop);  
+            if (access(path, R_OK) == 0) break;  
+  
+            snprintf(path, sizeof(path), "%s/%s.%s.so",  
+                     HAL_LIBRARY_PATH2, id, prop);  
+            if (access(path, R_OK) == 0) break;  
+        } else {  
+            snprintf(path, sizeof(path), "%s/%s.default.so",  
+                     HAL_LIBRARY_PATH1, id);  
+            if (access(path, R_OK) == 0) break;  
+        }  
+    }  
+  
+    status = -ENOENT;  
+    if (i < HAL_VARIANT_KEYS_COUNT+1) {  
+        /* load the module, if this fails, we're doomed, and we should not try 
+         * to load a different variant. */  
+        status = load(id, path, module);  
+    }  
+  
+    return status;  
+}  
+
+函数 hw_get_module 依次在目录/system/lib/hw和/vendor/lib/hw中查找一个名称 为"<MODULE_ID>.variant.so"的文件
+
+其中，<MODULE_ID>是一个模块ID，而variant表 示"ro.hardware"、"ro.product.board"、"ro.board.platform"和"ro.arch"四个系统属性值之 一。
+
+例如，对于Gralloc模块来说，函数hw_get_module依次在目录/system/lib/hw和/vendor/lib/hw中检查是 否存在以下四个文件：
+
+ gralloc.<ro.hardware>.so
+
+ gralloc.<ro.product.board>.so
+
+ gralloc.<ro.board.platform>.so
+
+ gralloc.<ro.arch>.so
+
+只要其中的一个文件存在，函数hw_get_module就会停止查找过程，并且调用另外一个函数load来将这个文件加载到内存中来。
+
+另一方面，如果在/system/lib/hw和/vendor/lib/hw中均不存这些文件，那么函数hw_get_module就会在目录/system /lib/hw中查找是否存在一个名称为gralloc.default.so的文件。
+
+如果存在的话，那么也会调用函数load将它加载到内存中来。
+
+
+函数load也是实现在文件hardware/libhardware/hardware.c文件中，如下所示：
+static int load(const char *id,  
+        const char *path,  
+        const struct hw_module_t **pHmi)  
+{  
+    int status;  
+    void *handle;  
+    struct hw_module_t *hmi;  
+  
+    /* 
+     * load the symbols resolving undefined symbols before 
+     * dlopen returns. Since RTLD_GLOBAL is not or'd in with 
+     * RTLD_NOW the external symbols will not be global 
+     */  
+    handle = dlopen(path, RTLD_NOW);  
+    if (handle == NULL) {  
+        char const *err_str = dlerror();  
+        LOGE("load: module=%s\n%s", path, err_str?err_str:"unknown");  
+        status = -EINVAL;  
+        goto done;  
+    }  
+  
+    /* Get the address of the struct hal_module_info. */  
+    const char *sym = HAL_MODULE_INFO_SYM_AS_STR;  
+    hmi = (struct hw_module_t *)dlsym(handle, sym);  
+    if (hmi == NULL) {  
+        LOGE("load: couldn't find symbol %s", sym);  
+        status = -EINVAL;  
+        goto done;  
+    }  
+  
+    /* Check that the id matches */  
+    if (strcmp(id, hmi->id) != 0) {  
+        LOGE("load: id=%s != hmi->id=%s", id, hmi->id);  
+        status = -EINVAL;  
+        goto done;  
+    }  
+  
+    hmi->dso = handle;  
+  
+    /* success */  
+    status = 0;  
+  
+    done:  
+    if (status != 0) {  
+        hmi = NULL;  
+        if (handle != NULL) {  
+            dlclose(handle);  
+            handle = NULL;  
+        }  
+    } else {  
+        LOGV("loaded HAL id=%s path=%s hmi=%p handle=%p",  
+                id, path, *pHmi, handle);  
+    }  
+  
+    *pHmi = hmi;  
+  
+    return status;  
+}  
+
+ 在Linux系统中，后缀名为"so"的文件为动态链接库文件，可能通过函数dlopen来加载到内存中。硬件抽象层模块编写规范规定每一个硬件抽象层 模块都必须导出一个符号名称为HAL_MODULE_INFO_SYM_AS_STR的符号，而且这个符号必须是用来描述一个类型为 hw_module_t的结构体的。
+
+
+HAL_MODULE_INFO_SYM_AS_STR是一个宏，定义在文件hardware/libhardware/include/hardware/hardware.h文件中，如下所示：
+
+#define HAL_MODULE_INFO_SYM_AS_STR  "HMI"  
+
+
+将Gralloc模块加载到内存中来之后，就可以调用函数dlsym来获得它所导出的符号HMI。
+
+由于这个符号指向的是一个hw_module_t结构体，因此，最后函数load就可以强制地将这个符号转换为一个hw_module_t结构体指针，并且保存在输出参数pHmi中返回给调用者。
+
+调用者获得了这个 hw_module_t 结构体指针之后，就可以创建一个gralloc设备或者一个fb设备。
+
+模块Gralloc实现在目录hardware/libhardware/modules/gralloc中，它导出的符号HMI定义在文件 hardware/libhardware/modules/gralloc/gralloc.cpp文件中，如下所示：
+static struct hw_module_methods_t gralloc_module_methods = {  
+        open: gralloc_device_open  
+};  
+  
+struct private_module_t HAL_MODULE_INFO_SYM = {  
+    base: {  
+        common: {  
+            tag: HARDWARE_MODULE_TAG,  
+            version_major: 1,  
+            version_minor: 0,  
+            id: GRALLOC_HARDWARE_MODULE_ID,  
+            name: "Graphics Memory Allocator Module",  
+            author: "The Android Open Source Project",  
+            methods: &gralloc_module_methods  
+        },  
+        registerBuffer: gralloc_register_buffer,  
+        unregisterBuffer: gralloc_unregister_buffer,  
+        lock: gralloc_lock,  
+        unlock: gralloc_unlock,  
+    },  
+    framebuffer: 0,  
+    flags: 0,  
+    numBuffers: 0,  
+    bufferMask: 0,  
+    lock: PTHREAD_MUTEX_INITIALIZER,  
+    currentBuffer: 0,  
+};  
+ HAL_MODULE_INFO_SYM也是一个宏，它的值是与宏HAL_MODULE_INFO_SYM_AS_STR对应的，它也是定义在文件 hardware/libhardware/include/hardware/hardware.h文件中，如下所示：
+
+#define HAL_MODULE_INFO_SYM         HMI  
+
+
+
+
